@@ -5,11 +5,6 @@ Combina CNN 3D (imagens MRI) + Features Tabulares (clínicas/cognitivas)
 
 TCC - Samuel Augusto Souza Alves Santana
 Universidade Federal de Sergipe
-
-Estratégias de Fusão:
-1. Early Fusion: Concatena features da CNN com tabulares antes do classificador
-2. Late Fusion: Média/votação das probabilidades dos dois modelos
-3. Intermediate Fusion: Combina embeddings intermediários
 """
 
 import os
@@ -17,14 +12,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix, balanced_accuracy_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 import json
-from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -38,7 +31,7 @@ NUM_EPOCHS = 50
 EARLY_STOPPING_PATIENCE = 10
 
 PREPROCESSED_DIR = "./oasis3_preprocessed"
-TABULAR_DATA_FILE = "mci_dataset_improved.csv"  # Dataset com features tabulares
+TABULAR_DATA_FILE = "mci_dataset_improved.csv"
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -47,12 +40,10 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # ============================================
 
 class MultimodalDataset(Dataset):
-    """Dataset que combina imagens MRI 3D + features tabulares"""
-    
     def __init__(self, subject_ids, labels, tabular_features, image_dir, augment=False):
         self.subject_ids = subject_ids
         self.labels = labels
-        self.tabular_features = tabular_features  # numpy array normalizado
+        self.tabular_features = tabular_features
         self.image_dir = image_dir
         self.augment = augment
     
@@ -64,69 +55,51 @@ class MultimodalDataset(Dataset):
         label = self.labels[idx]
         tabular = self.tabular_features[idx]
         
-        # Carregar imagem
         filepath = os.path.join(self.image_dir, f"{subject_id}.npy")
         image = np.load(filepath)
-        image = np.expand_dims(image, axis=0)  # Adicionar canal
+        image = np.expand_dims(image, axis=0)
         
-        # Data augmentation
         if self.augment:
-            image = self._augment(image)
+            if np.random.rand() > 0.5:
+                image = np.flip(image, axis=3).copy()
+            if np.random.rand() > 0.5:
+                image = np.flip(image, axis=1).copy()
+            if np.random.rand() > 0.5:
+                noise = np.random.normal(0, 0.01, image.shape)
+                image = np.clip(image + noise, 0, 1)
         
-        # Converter para tensores
-        image = torch.FloatTensor(image)
-        tabular = torch.FloatTensor(tabular)
-        label = torch.FloatTensor([label])
-        
-        return image, tabular, label
-    
-    def _augment(self, image):
-        if np.random.rand() > 0.5:
-            image = np.flip(image, axis=3).copy()
-        if np.random.rand() > 0.5:
-            image = np.flip(image, axis=1).copy()
-        if np.random.rand() > 0.5:
-            noise = np.random.normal(0, 0.01, image.shape)
-            image = np.clip(image + noise, 0, 1)
-        return image
+        return torch.FloatTensor(image), torch.FloatTensor(tabular), torch.FloatTensor([label])
 
 
 # ============================================
-# ARQUITETURAS DE FUSÃO
+# ARQUITETURAS
 # ============================================
 
 class CNN3D_Encoder(nn.Module):
-    """Encoder CNN 3D - extrai features das imagens"""
-    
     def __init__(self):
         super(CNN3D_Encoder, self).__init__()
         
         self.features = nn.Sequential(
-            # Bloco 1: 128 -> 64
             nn.Conv3d(1, 16, kernel_size=3, padding=1),
             nn.BatchNorm3d(16),
             nn.ReLU(inplace=True),
             nn.MaxPool3d(2),
             
-            # Bloco 2: 64 -> 32
             nn.Conv3d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool3d(2),
             
-            # Bloco 3: 32 -> 16
             nn.Conv3d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool3d(2),
             
-            # Bloco 4: 16 -> 8
             nn.Conv3d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool3d(2),
             
-            # Global pooling
             nn.AdaptiveAvgPool3d((1, 1, 1)),
             nn.Flatten()
         )
@@ -140,12 +113,10 @@ class CNN3D_Encoder(nn.Module):
     def forward(self, x):
         x = self.features(x)
         x = self.embedding(x)
-        return x  # Output: 64-dim embedding
+        return x
 
 
 class TabularEncoder(nn.Module):
-    """Encoder para features tabulares"""
-    
     def __init__(self, input_dim, embedding_dim=64):
         super(TabularEncoder, self).__init__()
         
@@ -161,19 +132,11 @@ class TabularEncoder(nn.Module):
         )
     
     def forward(self, x):
-        return self.encoder(x)  # Output: 64-dim embedding
+        return self.encoder(x)
 
 
 class MultimodalFusion_Early(nn.Module):
-    """
-    Early Fusion: Concatena embeddings CNN + Tabular antes da classificação
-    
-    [Image] -> CNN Encoder -> 64-dim
-                                    \
-                                     -> Concat (128-dim) -> Classifier -> Output
-                                    /
-    [Tabular] -> Tab Encoder -> 64-dim
-    """
+    """Early Fusion: Concatena embeddings antes do classificador"""
     
     def __init__(self, tabular_input_dim, dropout=0.5):
         super(MultimodalFusion_Early, self).__init__()
@@ -181,9 +144,8 @@ class MultimodalFusion_Early(nn.Module):
         self.cnn_encoder = CNN3D_Encoder()
         self.tabular_encoder = TabularEncoder(tabular_input_dim, embedding_dim=64)
         
-        # Classificador após fusão
         self.classifier = nn.Sequential(
-            nn.Linear(128, 64),  # 64 (CNN) + 64 (Tabular) = 128
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(64, 32),
@@ -196,19 +158,12 @@ class MultimodalFusion_Early(nn.Module):
     def forward(self, image, tabular):
         cnn_features = self.cnn_encoder(image)
         tab_features = self.tabular_encoder(tabular)
-        
-        # Concatenar embeddings
         fused = torch.cat([cnn_features, tab_features], dim=1)
-        
         return self.classifier(fused)
 
 
 class MultimodalFusion_Intermediate(nn.Module):
-    """
-    Intermediate Fusion com Attention
-    
-    Usa mecanismo de atenção para ponderar a importância de cada modalidade
-    """
+    """Intermediate Fusion com Attention"""
     
     def __init__(self, tabular_input_dim, dropout=0.5):
         super(MultimodalFusion_Intermediate, self).__init__()
@@ -216,15 +171,13 @@ class MultimodalFusion_Intermediate(nn.Module):
         self.cnn_encoder = CNN3D_Encoder()
         self.tabular_encoder = TabularEncoder(tabular_input_dim, embedding_dim=64)
         
-        # Attention mechanism
         self.attention = nn.Sequential(
             nn.Linear(128, 64),
             nn.Tanh(),
-            nn.Linear(64, 2),  # 2 modalidades
+            nn.Linear(64, 2),
             nn.Softmax(dim=1)
         )
         
-        # Classificador
         self.classifier = nn.Sequential(
             nn.Linear(64, 32),
             nn.ReLU(inplace=True),
@@ -234,14 +187,12 @@ class MultimodalFusion_Intermediate(nn.Module):
         )
     
     def forward(self, image, tabular):
-        cnn_features = self.cnn_encoder(image)      # (batch, 64)
-        tab_features = self.tabular_encoder(tabular) # (batch, 64)
+        cnn_features = self.cnn_encoder(image)
+        tab_features = self.tabular_encoder(tabular)
         
-        # Calcular pesos de atenção
-        combined = torch.cat([cnn_features, tab_features], dim=1)  # (batch, 128)
-        attention_weights = self.attention(combined)  # (batch, 2)
+        combined = torch.cat([cnn_features, tab_features], dim=1)
+        attention_weights = self.attention(combined)
         
-        # Fusão ponderada
         fused = (attention_weights[:, 0:1] * cnn_features + 
                  attention_weights[:, 1:2] * tab_features)
         
@@ -249,20 +200,11 @@ class MultimodalFusion_Intermediate(nn.Module):
 
 
 class MultimodalFusion_Late(nn.Module):
-    """
-    Late Fusion: Treina modelos separados e combina predições
-    
-    [Image] -> CNN Model -> prob_cnn
-                                     \
-                                      -> Weighted Average -> Final Output
-                                     /
-    [Tabular] -> Tab Model -> prob_tab
-    """
+    """Late Fusion: Combina probabilidades"""
     
     def __init__(self, tabular_input_dim, dropout=0.5):
         super(MultimodalFusion_Late, self).__init__()
         
-        # Modelo CNN completo
         self.cnn_encoder = CNN3D_Encoder()
         self.cnn_classifier = nn.Sequential(
             nn.Linear(64, 32),
@@ -272,7 +214,6 @@ class MultimodalFusion_Late(nn.Module):
             nn.Sigmoid()
         )
         
-        # Modelo Tabular completo
         self.tabular_encoder = TabularEncoder(tabular_input_dim, embedding_dim=64)
         self.tabular_classifier = nn.Sequential(
             nn.Linear(64, 32),
@@ -282,19 +223,16 @@ class MultimodalFusion_Late(nn.Module):
             nn.Sigmoid()
         )
         
-        # Peso aprendível para fusão
         self.fusion_weight = nn.Parameter(torch.tensor([0.5]))
     
     def forward(self, image, tabular):
-        # Predições individuais
         cnn_features = self.cnn_encoder(image)
         cnn_pred = self.cnn_classifier(cnn_features)
         
         tab_features = self.tabular_encoder(tabular)
         tab_pred = self.tabular_classifier(tab_features)
         
-        # Fusão ponderada (peso aprendível)
-        w = torch.sigmoid(self.fusion_weight)  # Entre 0 e 1
+        w = torch.sigmoid(self.fusion_weight)
         fused_pred = w * cnn_pred + (1 - w) * tab_pred
         
         return fused_pred, cnn_pred, tab_pred
@@ -304,16 +242,13 @@ class MultimodalFusion_Late(nn.Module):
 # TREINAMENTO
 # ============================================
 
-def train_epoch_multimodal(model, dataloader, criterion, optimizer, device, fusion_type='early'):
+def train_epoch(model, dataloader, criterion, optimizer, device, fusion_type='early'):
     model.train()
     total_loss = 0
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
     
     for images, tabular, labels in dataloader:
-        images = images.to(device)
-        tabular = tabular.to(device)
-        labels = labels.to(device)
+        images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
         
         optimizer.zero_grad()
         
@@ -321,7 +256,7 @@ def train_epoch_multimodal(model, dataloader, criterion, optimizer, device, fusi
             outputs, _ = model(images, tabular)
         elif fusion_type == 'late':
             outputs, _, _ = model(images, tabular)
-        else:  # early
+        else:
             outputs = model(images, tabular)
         
         loss = criterion(outputs, labels)
@@ -335,24 +270,21 @@ def train_epoch_multimodal(model, dataloader, criterion, optimizer, device, fusi
     return total_loss / len(dataloader), np.array(all_preds), np.array(all_labels)
 
 
-def evaluate_multimodal(model, dataloader, criterion, device, fusion_type='early'):
+def evaluate(model, dataloader, criterion, device, fusion_type='early'):
     model.eval()
     total_loss = 0
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
     attention_weights_all = []
     
     with torch.no_grad():
         for images, tabular, labels in dataloader:
-            images = images.to(device)
-            tabular = tabular.to(device)
-            labels = labels.to(device)
+            images, tabular, labels = images.to(device), tabular.to(device), labels.to(device)
             
             if fusion_type == 'intermediate':
                 outputs, att_weights = model(images, tabular)
                 attention_weights_all.extend(att_weights.cpu().numpy())
             elif fusion_type == 'late':
-                outputs, cnn_pred, tab_pred = model(images, tabular)
+                outputs, _, _ = model(images, tabular)
             else:
                 outputs = model(images, tabular)
             
@@ -364,26 +296,21 @@ def evaluate_multimodal(model, dataloader, criterion, device, fusion_type='early
     return total_loss / len(dataloader), np.array(all_preds), np.array(all_labels), attention_weights_all
 
 
-def train_multimodal_model(model, train_loader, val_loader, num_epochs, device, 
-                           learning_rate=1e-4, patience=10, fusion_type='early'):
+def train_model(model, train_loader, val_loader, num_epochs, device, 
+                learning_rate=1e-4, patience=10, fusion_type='early'):
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
     
     best_auc = 0
     patience_counter = 0
-    history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
     
     for epoch in range(num_epochs):
-        train_loss, _, _ = train_epoch_multimodal(model, train_loader, criterion, optimizer, device, fusion_type)
-        val_loss, val_preds, val_labels, att_weights = evaluate_multimodal(model, val_loader, criterion, device, fusion_type)
+        train_loss, _, _ = train_epoch(model, train_loader, criterion, optimizer, device, fusion_type)
+        val_loss, val_preds, val_labels, _ = evaluate(model, val_loader, criterion, device, fusion_type)
         
         val_auc = roc_auc_score(val_labels.flatten(), val_preds.flatten())
         scheduler.step(val_loss)
-        
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['val_auc'].append(val_auc)
         
         if val_auc > best_auc:
             best_auc = val_auc
@@ -398,11 +325,11 @@ def train_multimodal_model(model, train_loader, val_loader, num_epochs, device,
         if (epoch + 1) % 5 == 0:
             print(f"  Época {epoch+1}/{num_epochs}: Train Loss={train_loss:.4f}, Val AUC={val_auc:.4f}")
     
-    return history, best_auc
+    return best_auc
 
 
 # ============================================
-# PREPARAR DADOS TABULARES
+# PREPARAR DADOS
 # ============================================
 
 def prepare_tabular_data(tabular_file, subject_ids):
@@ -410,9 +337,9 @@ def prepare_tabular_data(tabular_file, subject_ids):
     
     df = pd.read_csv(tabular_file)
     
-    # Features a usar (as mesmas do modelo tabular)
+    # Features disponíveis
     feature_cols = [
-        'baseline_age', 'sex_numeric', 'education', 'apoe4_positive',
+        'baseline_age', 'sex_numeric', 'EDUC', 'has_apoe4',
         'baseline_mmse', 'baseline_cdrsum',
         'LOGIMEM', 'MEMUNITS', 'ANIMALS', 'VEG', 'digfor', 'digback',
         'tma', 'tmb', 'craftvrs', 'craftdvr', 'mocatots',
@@ -420,18 +347,16 @@ def prepare_tabular_data(tabular_file, subject_ids):
         'TOTAL_HIPPOCAMPUS_VOLUME', 'Left-Hippocampus_volume', 'Right-Hippocampus_volume'
     ]
     
-    # Filtrar colunas disponíveis
     available_cols = [c for c in feature_cols if c in df.columns]
     print(f"  Features tabulares disponíveis: {len(available_cols)}")
     
     # Filtrar sujeitos com imagens
-    df_filtered = df[df['subject'].isin(subject_ids)].copy()
-    df_filtered = df_filtered.set_index('subject')
-    df_filtered = df_filtered.loc[subject_ids]  # Manter ordem
+    df_filtered = df[df['OASISID'].isin(subject_ids)].copy()
+    df_filtered = df_filtered.set_index('OASISID')
+    df_filtered = df_filtered.loc[subject_ids]
     
-    # Extrair features e labels
     X = df_filtered[available_cols].values
-    y = df_filtered['conversion_label'].values
+    y = df_filtered['label'].values
     
     # Imputar e normalizar
     imputer = SimpleImputer(strategy='median')
@@ -447,8 +372,7 @@ def prepare_tabular_data(tabular_file, subject_ids):
 # VALIDAÇÃO CRUZADA
 # ============================================
 
-def run_multimodal_cv(subject_ids, labels, tabular_features, image_dir, 
-                      n_folds=5, fusion_type='early'):
+def run_cv(subject_ids, labels, tabular_features, image_dir, n_folds=5, fusion_type='early'):
     
     print(f"\n{'='*50}")
     print(f"FUSÃO: {fusion_type.upper()}")
@@ -456,13 +380,11 @@ def run_multimodal_cv(subject_ids, labels, tabular_features, image_dir,
     
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
     results = []
-    
     tabular_dim = tabular_features.shape[1]
     
     for fold, (train_idx, val_idx) in enumerate(skf.split(subject_ids, labels)):
         print(f"\n--- Fold {fold+1}/{n_folds} ---")
         
-        # Split
         train_subjects = [subject_ids[i] for i in train_idx]
         train_labels = [labels[i] for i in train_idx]
         train_tabular = tabular_features[train_idx]
@@ -473,7 +395,6 @@ def run_multimodal_cv(subject_ids, labels, tabular_features, image_dir,
         
         print(f"  Train: {len(train_subjects)} | Val: {len(val_subjects)}")
         
-        # Datasets
         train_dataset = MultimodalDataset(train_subjects, train_labels, train_tabular, image_dir, augment=True)
         val_dataset = MultimodalDataset(val_subjects, val_labels, val_tabular, image_dir, augment=False)
         
@@ -485,47 +406,32 @@ def run_multimodal_cv(subject_ids, labels, tabular_features, image_dir,
             model = MultimodalFusion_Early(tabular_dim).to(DEVICE)
         elif fusion_type == 'intermediate':
             model = MultimodalFusion_Intermediate(tabular_dim).to(DEVICE)
-        elif fusion_type == 'late':
+        else:
             model = MultimodalFusion_Late(tabular_dim).to(DEVICE)
         
         # Treinar
-        history, best_auc = train_multimodal_model(
-            model, train_loader, val_loader,
-            num_epochs=NUM_EPOCHS, device=DEVICE,
-            learning_rate=LEARNING_RATE, patience=EARLY_STOPPING_PATIENCE,
-            fusion_type=fusion_type
-        )
+        best_auc = train_model(model, train_loader, val_loader, NUM_EPOCHS, DEVICE,
+                               LEARNING_RATE, EARLY_STOPPING_PATIENCE, fusion_type)
         
         # Avaliar
         model.load_state_dict(torch.load(f'best_multimodal_{fusion_type}.pt'))
-        _, val_preds, val_labels_arr, att_weights = evaluate_multimodal(
-            model, val_loader, nn.BCELoss(), DEVICE, fusion_type
-        )
+        _, val_preds, val_labels_arr, att_weights = evaluate(model, val_loader, nn.BCELoss(), DEVICE, fusion_type)
         
         val_preds_binary = (val_preds.flatten() > 0.5).astype(int)
         val_labels_flat = val_labels_arr.flatten().astype(int)
         
         auc = roc_auc_score(val_labels_flat, val_preds.flatten())
-        acc = accuracy_score(val_labels_flat, val_preds_binary)
         bal_acc = balanced_accuracy_score(val_labels_flat, val_preds_binary)
         
         tn, fp, fn, tp = confusion_matrix(val_labels_flat, val_preds_binary).ravel()
         sens = tp / (tp + fn) if (tp + fn) > 0 else 0
         spec = tn / (tn + fp) if (tn + fp) > 0 else 0
         
-        results.append({
-            'fold': fold + 1,
-            'auc': auc,
-            'accuracy': acc,
-            'balanced_accuracy': bal_acc,
-            'sensitivity': sens,
-            'specificity': spec
-        })
+        results.append({'fold': fold+1, 'auc': auc, 'bal_acc': bal_acc, 'sens': sens, 'spec': spec})
         
-        # Mostrar pesos de atenção se intermediate fusion
         if fusion_type == 'intermediate' and att_weights:
             avg_att = np.mean(att_weights, axis=0)
-            print(f"  Attention weights: CNN={avg_att[0]:.3f}, Tabular={avg_att[1]:.3f}")
+            print(f"  Attention: CNN={avg_att[0]:.3f}, Tabular={avg_att[1]:.3f}")
         
         print(f"  AUC: {auc:.4f} | Bal.Acc: {bal_acc:.4f} | Sens: {sens:.4f} | Spec: {spec:.4f}")
     
@@ -555,7 +461,7 @@ def main():
         return
     
     # Carregar sujeitos com imagens
-    image_subjects = [f.replace('.npy', '') for f in os.listdir(PREPROCESSED_DIR) if f.endswith('.npy')]
+    image_subjects = sorted([f.replace('.npy', '') for f in os.listdir(PREPROCESSED_DIR) if f.endswith('.npy')])
     print(f"\n[1] Sujeitos com imagens: {len(image_subjects)}")
     
     # Preparar dados tabulares
@@ -565,17 +471,14 @@ def main():
     print(f"    Shape: {tabular_features.shape}")
     print(f"    pMCI: {sum(labels)} | sMCI: {len(labels) - sum(labels)}")
     
-    # Testar diferentes estratégias de fusão
+    # Testar estratégias de fusão
     all_results = {}
     
     for fusion_type in ['early', 'intermediate', 'late']:
-        results = run_multimodal_cv(
-            image_subjects, labels, tabular_features, PREPROCESSED_DIR,
-            n_folds=5, fusion_type=fusion_type
-        )
+        results = run_cv(image_subjects, labels, tabular_features, PREPROCESSED_DIR, n_folds=5, fusion_type=fusion_type)
         all_results[fusion_type] = results
     
-    # Resumo final
+    # Resumo
     print("\n" + "=" * 60)
     print("RESULTADOS FINAIS - MODELOS MULTIMODAIS")
     print("=" * 60)
@@ -583,9 +486,9 @@ def main():
     summary = []
     for fusion_type, results in all_results.items():
         aucs = [r['auc'] for r in results]
-        bal_accs = [r['balanced_accuracy'] for r in results]
-        sens = [r['sensitivity'] for r in results]
-        specs = [r['specificity'] for r in results]
+        bal_accs = [r['bal_acc'] for r in results]
+        sens = [r['sens'] for r in results]
+        specs = [r['spec'] for r in results]
         
         summary.append({
             'fusion_type': fusion_type,
@@ -598,26 +501,22 @@ def main():
         
         print(f"\n{fusion_type.upper()} FUSION:")
         print(f"  AUC:         {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
-        print(f"  Bal.Acc:     {np.mean(bal_accs):.4f} ± {np.std(bal_accs):.4f}")
+        print(f"  Bal.Acc:     {np.mean(bal_accs):.4f}")
         print(f"  Sensitivity: {np.mean(sens):.4f}")
         print(f"  Specificity: {np.mean(specs):.4f}")
     
-    # Comparação com modelos unimodais
     print("\n" + "-" * 60)
     print("COMPARAÇÃO COM MODELOS UNIMODAIS:")
     print("-" * 60)
-    print("  Regressão Logística (tabular): AUC = 0.837 ± 0.041")
-    print("  CNN 3D (imagem):               AUC = 0.828 ± 0.054")
+    print("  Regressão Logística (tabular): AUC = 0.837")
+    print("  CNN 3D (imagem):               AUC = 0.828")
     
     best = max(summary, key=lambda x: x['auc_mean'])
     print(f"\n  MELHOR MULTIMODAL ({best['fusion_type']}): AUC = {best['auc_mean']:.4f} ± {best['auc_std']:.4f}")
     
-    # Salvar resultados
+    # Salvar
     with open('multimodal_results.json', 'w') as f:
-        json.dump({
-            'results_per_fusion': all_results,
-            'summary': summary
-        }, f, indent=2, default=float)
+        json.dump({'results': all_results, 'summary': summary}, f, indent=2, default=float)
     
     print("\n✓ Resultados salvos em multimodal_results.json")
 
